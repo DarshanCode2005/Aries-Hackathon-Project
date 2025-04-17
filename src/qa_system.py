@@ -4,7 +4,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import textwrap
 from pathlib import Path
 import pickle
@@ -56,17 +56,16 @@ class RAGQASystem:
         
         # Initialize Gemini
         api_key = os.getenv('GEMINI_API_KEY')
-        if api_key:
-            try:
-                genai.configure(api_key=api_key)
-                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-                logger.info("Successfully initialized Gemini model")
-            except Exception as e:
-                logger.error(f"Error initializing Gemini model: {str(e)}")
-                self.gemini_model = None
-        else:
-            logger.warning("GEMINI_API_KEY not found in environment variables")
-            self.gemini_model = None
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+            
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-pro')
+            logger.info("Successfully initialized Gemini model")
+        except Exception as e:
+            logger.error(f"Error initializing Gemini model: {str(e)}")
+            raise
     
     def create_text_chunks(self, text: str, chunk_size: int = 512) -> List[str]:
         """
@@ -193,52 +192,33 @@ class RAGQASystem:
             logger.error(f"Error retrieving context: {str(e)}")
             return []
     
-    def generate_answer(self, query: str, context: str) -> str:
+    def generate_answer(self, prompt: str, context: Optional[str] = None) -> str:
         """
-        Generate answer using Gemini API.
+        Generate an answer using Gemini.
         
         Args:
-            query (str): User's question
-            context (str): Retrieved context
+            prompt (str): The question or prompt
+            context (Optional[str]): Additional context for the question
             
         Returns:
             str: Generated answer
         """
-        if not self.gemini_model:
-            return "Error: Gemini API key not configured"
-            
         try:
-            prompt = f"""You are a helpful research assistant. Using ONLY the provided context, answer the question. 
-            If you cannot answer the question based on the context, explain why.
+            # Combine prompt and context
+            full_prompt = prompt
+            if context:
+                full_prompt = f"{prompt}\n\nContext:\n{context}"
             
-            Context:
-            ```
-            {context}
-            ```
+            # Generate response
+            response = self.model.generate_content(full_prompt)
             
-            Question: {query}
-            
-            Instructions:
-            1. Use ONLY the information from the context above
-            2. If the context doesn't contain relevant information, say so
-            3. Provide specific details and cite from the context when possible
-            4. Be concise but thorough
-            
-            Answer:"""
-            
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config={
-                    'temperature': 0.3,
-                    'top_p': 0.8,
-                    'top_k': 40
-                }
-            )
-            return response.text
+            if response and response.text:
+                return response.text.strip()
+            return "Unable to generate response."
             
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
-            return f"Error generating answer: {str(e)}"
+            return f"Error: {str(e)}"
 
     def process_latex(self, text: str) -> str:
         """
@@ -274,9 +254,6 @@ class RAGQASystem:
         Returns:
             str: Formatted text
         """
-        if not self.gemini_model:
-            return text
-            
         try:
             prompt = f"""Format the following text to have proper spacing between words and proper mathematical notation. 
             Preserve all LaTeX expressions (content between $ signs or \\[ \\]) exactly as they are.
@@ -287,7 +264,7 @@ class RAGQASystem:
             {text}
             """
             
-            response = self.gemini_model.generate_content(
+            response = self.model.generate_content(
                 prompt,
                 generation_config={
                     'temperature': 0,
