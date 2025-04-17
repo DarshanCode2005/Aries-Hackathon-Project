@@ -1,0 +1,12 @@
+venv/
+data/processed/
+data/raw/
+venv/
+results/
+models/
+model_path/
+
+env/
+
+.env
+# Ensure .env is not tracked
