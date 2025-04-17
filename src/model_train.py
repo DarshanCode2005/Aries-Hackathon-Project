@@ -9,24 +9,28 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.pipeline import Pipeline
 from sklearn.svm import SVC  # Adding SVM as an alternative classifier
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
 import joblib
 import os
 import logging
 from typing import Tuple, Dict
 import json
+import pickle
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class PaperClassifier:
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', n_splits: int = 5):
+    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', n_splits: int = 5, use_smote: bool = True):
         """
         Initialize the paper classifier with specified embedding model.
         
         Args:
             model_name (str): Name of the sentence transformer model to use
             n_splits (int): Number of cross-validation splits
+            use_smote (bool): Whether to use SMOTE for handling class imbalance
         """
         self.embedding_model = SentenceTransformer(model_name)
         self.scaler = StandardScaler()
@@ -34,6 +38,7 @@ class PaperClassifier:
         self.label_encoder = LabelEncoder()
         self.cv_results = None
         self.n_splits = n_splits
+        self.use_smote = use_smote
         
     def generate_embeddings(self, texts: list) -> np.ndarray:
         """
@@ -55,26 +60,21 @@ class PaperClassifier:
         embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
         return embeddings
     
-    def get_cv_scores(self, X: np.ndarray, y: np.array) -> Dict:
-        """
-        Get cross-validation scores.
+    def get_cv_scores(self, X, y, cv=3):
+        """Get cross-validation scores for the trained classifier."""
+        if not hasattr(self, 'classifier') or self.classifier is None:
+            raise ValueError("Classifier not trained yet")
         
-        Args:
-            X (np.ndarray): Features
-            y (np.array): Labels
-            
-        Returns:
-            Dict: Cross-validation scores
-        """
-        if self.cv_results is None:
-            cv = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
-            cv_scores = cross_val_score(self.pipeline, X, y, cv=cv, scoring='f1_weighted')
-            self.cv_results = {
-                'mean_cv_score': cv_scores.mean(),
-                'std_cv_score': cv_scores.std() * 2,
-                'individual_scores': cv_scores.tolist()
-            }
-        return self.cv_results
+        # For small datasets where we used a simple model
+        if isinstance(self.classifier, ImbPipeline):
+            logging.info("Using simple validation for small dataset")
+            y_pred = self.classifier.predict(X)
+            score = f1_score(y, y_pred, average='weighted')
+            return np.array([score])  # Return as array to match cross_val_score format
+        
+        # For larger datasets where we used cross-validation
+        cv_scores = cross_val_score(self.classifier, X, y, cv=cv, scoring='f1_weighted')
+        return cv_scores
     
     def train(self, X_train: np.ndarray, y_train: np.array) -> None:
         """
@@ -84,137 +84,167 @@ class PaperClassifier:
             X_train (np.ndarray): Training features (embeddings)
             y_train (np.array): Training labels
         """
+        logger.info("\nTraining model...")
         logger.info("Training classifier with hyperparameter tuning...")
         
-        # Always fit the label encoder, regardless of input type
-        self.label_encoder.fit(y_train)
-        y_train_encoded = self.label_encoder.transform(y_train)
+        # Log class distribution
+        unique, counts = np.unique(y_train, return_counts=True)
+        for label, count in zip(unique, counts):
+            logger.info(f"Class {label}: {count} samples")
         
-        # Get the size of the smallest class
-        min_class_size = np.min(np.bincount(y_train_encoded))
-        
-        # Adjust n_splits based on the smallest class size
-        n_splits = min(self.n_splits, min_class_size)
-        logger.info(f"Using {n_splits}-fold cross-validation based on smallest class size of {min_class_size}")
+        # Determine minimum samples and strategy
+        min_samples = min(counts)
+        logger.info(f"Minimum samples in any class: {min_samples}")
         
         # Compute class weights
-        class_weights = compute_class_weight(
-            class_weight='balanced',
-            classes=np.unique(y_train_encoded),
-            y=y_train_encoded
-        )
-        class_weight_dict = dict(zip(np.unique(y_train_encoded), class_weights))
+        class_weights = dict(zip(unique, len(y_train) / (len(unique) * counts)))
+        logger.info(f"Class weights: {class_weights}")
         
-        # Try multiple classifiers including Random Forest
-        pipelines = {
-            'random_forest': Pipeline([
+        # For small datasets, use a simple approach without cross-validation
+        if min_samples < 5:
+            logger.info("Small dataset detected, using simple model without cross-validation")
+            try:
+                # Try different simple models with class weights and regularization
+                models = [
+                    ('rf', RandomForestClassifier(
+                        n_estimators=100,
+                        max_depth=3,
+                        min_samples_split=2,
+                        class_weight=class_weights,
+                        random_state=42
+                    )),
+                    ('lr', LogisticRegression(
+                        C=0.1,  # Stronger regularization
+                        class_weight=class_weights,
+                        max_iter=1000,
+                        random_state=42
+                    ))
+                ]
+                
+                best_score = -1
+                best_pipeline = None
+                
+                for name, model in models:
+                    try:
+                        pipeline = ImbPipeline([
+                            ('scaler', StandardScaler()),
+                            ('resampler', RandomOverSampler(random_state=42)),
+                            ('classifier', model)
+                        ])
+                        
+                        # Fit and evaluate using stratified K-fold
+                        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+                        scores = []
+                        
+                        for train_idx, val_idx in cv.split(X_train, y_train):
+                            X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+                            y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+                            
+                            pipeline.fit(X_fold_train, y_fold_train)
+                            y_pred = pipeline.predict(X_fold_val)
+                            score = f1_score(y_fold_val, y_pred, average='weighted', zero_division=0)
+                            scores.append(score)
+                        
+                        avg_score = np.mean(scores)
+                        logger.info(f"{name} cross-validation f1 scores: {scores}")
+                        logger.info(f"{name} average f1 score: {avg_score:.3f}")
+                        
+                        if avg_score > best_score:
+                            best_score = avg_score
+                            # Retrain on full training set
+                            pipeline.fit(X_train, y_train)
+                            best_pipeline = pipeline
+                            
+                    except Exception as e:
+                        logger.warning(f"Error during {name} training: \n{str(e)}")
+                        continue
+                
+                if best_pipeline is not None:
+                    self.classifier = best_pipeline
+                    logger.info(f"Selected best model with average f1 score: {best_score:.3f}")
+                    return
+                else:
+                    raise ValueError("No model could be trained successfully")
+                
+            except Exception as e:
+                logger.warning(f"Error during simple model training: \n{str(e)}")
+                raise ValueError("Could not train model even with simplified approach")
+        
+        # For larger datasets, use cross-validation and SMOTE
+        n_splits = min(3, min_samples)
+        logger.info(f"Using {n_splits}-fold cross-validation")
+        
+        # Try Random Forest first
+        logger.info("\nTrying random_forest classifier...")
+        try:
+            rf_pipeline = ImbPipeline([
                 ('scaler', StandardScaler()),
+                ('resampler', SMOTE(k_neighbors=min(min_samples - 1, 5), random_state=42)),
                 ('classifier', RandomForestClassifier(
-                    random_state=42,
-                    n_jobs=-1,  # Use all CPU cores
-                    class_weight='balanced',
-                    n_estimators=200  # Start with a reasonable number of trees
-                ))
-            ]),
-            'logistic': Pipeline([
-                ('scaler', StandardScaler()),
-                ('classifier', LogisticRegression(
-                    random_state=42,
-                    max_iter=5000,
-                    class_weight='balanced'
+                    class_weight=class_weights,
+                    random_state=42
                 ))
             ])
-        }
-        
-        # Simplified parameter grids to reduce computation time
-        param_grids = {
-            'random_forest': {
-                'classifier__n_estimators': [100, 200],
-                'classifier__max_depth': [None, 10, 20],
-                'classifier__min_samples_split': [2, 5],
-                'classifier__min_samples_leaf': [1, 2],
-                'classifier__max_features': ['sqrt']
-            },
-            'logistic': {
-                'classifier__C': [0.1, 1.0, 10.0],
-                'classifier__penalty': ['l2']
-            }
-        }
-        
-        # Set up cross-validation with reduced splits
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        
-        best_score = 0
-        best_pipeline = None
-        best_params = None
-        all_scores = {}
-        
-        # Try each classifier
-        for name, pipeline in pipelines.items():
-            logger.info(f"\nTrying {name} classifier...")
             
-            try:
-                # Perform grid search
-                grid_search = GridSearchCV(
-                    pipeline,
-                    param_grids[name],
-                    cv=cv,
-                    scoring='f1_weighted',
-                    n_jobs=-1,
-                    verbose=1
-                )
-                
-                grid_search.fit(X_train, y_train_encoded)
-                
-                # Store scores for this classifier
-                all_scores[name] = {
-                    'best_score': grid_search.best_score_,
-                    'best_params': grid_search.best_params_
-                }
-                
-                logger.info(f"{name} best parameters: {grid_search.best_params_}")
-                logger.info(f"{name} best score: {grid_search.best_score_:.4f}")
-                
-                if grid_search.best_score_ > best_score:
-                    best_score = grid_search.best_score_
-                    best_pipeline = grid_search.best_estimator_
-                    best_params = grid_search.best_params_
-                    
-            except Exception as e:
-                logger.warning(f"Error during {name} classifier training: {str(e)}")
-                continue
+            rf_param_grid = {
+                'classifier__n_estimators': [100, 200],
+                'classifier__max_depth': [3, 5],
+                'classifier__min_samples_split': [2, 3]
+            }
+            
+            rf_grid = GridSearchCV(
+                rf_pipeline, 
+                rf_param_grid,
+                cv=n_splits,
+                scoring='f1_weighted',
+                n_jobs=-1
+            )
+            
+            rf_grid.fit(X_train, y_train)
+            self.classifier = rf_grid.best_estimator_
+            logger.info(f"Best random forest parameters: {rf_grid.best_params_}")
+            logger.info(f"Best random forest score: {rf_grid.best_score_:.3f}")
+            return
+            
+        except Exception as e:
+            logger.warning(f"Error during random_forest classifier training: \n{str(e)}")
         
-        if best_pipeline is None:
-            raise ValueError("No classifier was successfully trained")
+        # Try Logistic Regression as fallback
+        logger.info("\nTrying logistic classifier...")
+        try:
+            lr_pipeline = ImbPipeline([
+                ('scaler', StandardScaler()),
+                ('resampler', SMOTE(k_neighbors=min(min_samples - 1, 5), random_state=42)),
+                ('classifier', LogisticRegression(
+                    class_weight=class_weights,
+                    random_state=42
+                ))
+            ])
+            
+            lr_param_grid = {
+                'classifier__C': [0.01, 0.1, 1.0],  # Add stronger regularization
+                'classifier__max_iter': [1000]
+            }
+            
+            lr_grid = GridSearchCV(
+                lr_pipeline, 
+                lr_param_grid,
+                cv=n_splits,
+                scoring='f1_weighted',
+                n_jobs=-1
+            )
+            
+            lr_grid.fit(X_train, y_train)
+            self.classifier = lr_grid.best_estimator_
+            logger.info(f"Best logistic regression parameters: {lr_grid.best_params_}")
+            logger.info(f"Best logistic regression score: {lr_grid.best_score_:.3f}")
+            return
+            
+        except Exception as e:
+            logger.warning(f"Error during logistic classifier training: \n{str(e)}")
         
-        # Log all classifier performances
-        logger.info("\nAll classifier performances:")
-        for name, score_info in all_scores.items():
-            logger.info(f"{name}: {score_info['best_score']:.4f}")
-        
-        logger.info(f"\nBest overall model: {type(best_pipeline.named_steps['classifier']).__name__}")
-        logger.info(f"Best parameters: {best_params}")
-        logger.info(f"Best cross-validation score: {best_score:.4f}")
-        
-        # Update pipeline with best model
-        self.pipeline = best_pipeline
-        
-        # Perform final cross-validation
-        cv_scores = cross_val_score(self.pipeline, X_train, y_train_encoded, cv=cv, scoring='f1_weighted')
-        logger.info(f"Final CV scores: {cv_scores}")
-        logger.info(f"Average CV score: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
-        
-        # Store CV results
-        self.cv_results = {
-            'mean_cv_score': cv_scores.mean(),
-            'std_cv_score': cv_scores.std() * 2,
-            'individual_scores': cv_scores.tolist(),
-            'best_model_type': type(best_pipeline.named_steps['classifier']).__name__,
-            'best_parameters': best_params,
-            'all_model_scores': all_scores,
-            'n_splits': n_splits
-        }
-        
+        raise ValueError("No classifier was successfully trained")
+    
     def predict(self, X: np.ndarray) -> np.array:
         """
         Make predictions on new data.
@@ -236,7 +266,7 @@ class PaperClassifier:
     
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
-        Get prediction probabilities.
+        Get probability estimates for samples.
         
         Args:
             X (np.ndarray): Features to predict on
@@ -244,9 +274,9 @@ class PaperClassifier:
         Returns:
             np.ndarray: Prediction probabilities
         """
-        if self.pipeline is None:
-            raise ValueError("Model not trained. Call train() first.")
-        return self.pipeline.predict_proba(X)
+        if not hasattr(self, 'classifier') or self.classifier is None:
+            raise ValueError("Classifier not trained yet")
+        return self.classifier.predict_proba(X)
     
     def get_feature_importance(self, X: np.ndarray) -> Dict:
         """
@@ -293,102 +323,46 @@ class PaperClassifier:
             
         return importance_dict
         
-    def evaluate(self, X_test: np.ndarray, y_test: np.array) -> Dict:
-        """
-        Evaluate the model performance.
+    def evaluate(self, X_test, y_test):
+        """Evaluate the trained classifier on test data."""
+        if not hasattr(self, 'classifier') or self.classifier is None:
+            raise ValueError("Classifier not trained yet")
         
-        Args:
-            X_test (np.ndarray): Test features
-            y_test (np.array): True labels (can be strings or numbers)
-            
-        Returns:
-            Dict: Dictionary containing evaluation metrics
-        """
-        if self.pipeline is None:
-            raise ValueError("Model not trained. Call train() first.")
-        
-        if not hasattr(self.label_encoder, 'classes_'):
-            raise ValueError("Label encoder not fitted. Train the model first.")
-            
-        # Get predictions
-        y_pred = self.predict(X_test)
-        y_proba = self.predict_proba(X_test)
-        
-        # Transform test labels to encoded format
-        y_test_encoded = self.label_encoder.transform(y_test)
-        
-        # Calculate metrics using encoded labels
-        metrics = {
-            'accuracy': accuracy_score(y_test_encoded, y_pred),
-            'f1_score': f1_score(y_test_encoded, y_pred, average='weighted'),
-            'classification_report': classification_report(y_test_encoded, y_pred),
-            'predictions': {
-                'true_labels': y_test.tolist(),  # Keep original labels in output
-                'predicted_labels': self.label_encoder.inverse_transform(y_pred).tolist(),  # Convert back to original labels
-                'probabilities': y_proba.tolist()
-            }
-        }
-        
-        # Add feature importance analysis
-        metrics['feature_importance'] = self.get_feature_importance(X_test)
-        
-        # Add prediction analysis
-        metrics['prediction_analysis'] = {
-            'mean_probability_class_0': float(np.mean(y_proba[:, 0])),
-            'mean_probability_class_1': float(np.mean(y_proba[:, 1])),
-            'std_probability_class_0': float(np.std(y_proba[:, 0])),
-            'std_probability_class_1': float(np.std(y_proba[:, 1])),
-            'prediction_confidence': float(np.mean(np.max(y_proba, axis=1)))
-        }
-        
-        return metrics
+        y_pred = self.classifier.predict(X_test)
+        report = classification_report(y_test, y_pred, zero_division=0)
+        return report, y_test, y_pred
     
     def save_model(self, output_dir: str) -> None:
-        """
-        Save the trained model and components.
+        """Save the trained model to disk."""
+        if not hasattr(self, 'classifier') or self.classifier is None:
+            raise ValueError("Classifier not trained yet")
         
-        Args:
-            output_dir (str): Directory to save model files
-        """
-        if self.pipeline is None:
-            raise ValueError("Model not trained. Call train() first.")
-            
         os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'paper_classifier.pkl')
         
-        # Save the pipeline
-        joblib.dump(self.pipeline, os.path.join(output_dir, 'classifier.joblib'))
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.classifier, f)
         
-        # Save the label encoder
-        joblib.dump(self.label_encoder, os.path.join(output_dir, 'label_encoder.joblib'))
-        
-        # Save cross-validation results if available
-        if self.cv_results:
-            with open(os.path.join(output_dir, 'cv_results.json'), 'w') as f:
-                json.dump(self.cv_results, f)
-    
-    def load_model(self, model_dir: str) -> None:
-        """
-        Load a trained model and components.
-        
-        Args:
-            model_dir (str): Directory containing model files
-        """
-        self.pipeline = joblib.load(os.path.join(model_dir, 'classifier.joblib'))
-        self.label_encoder = joblib.load(os.path.join(model_dir, 'label_encoder.joblib'))
-        
-        # Load CV results if available
-        cv_results_path = os.path.join(model_dir, 'cv_results.json')
-        if os.path.exists(cv_results_path):
-            with open(cv_results_path, 'r') as f:
-                self.cv_results = json.load(f)
+        logger.info(f"Model saved to {model_path}")
 
-def train_and_evaluate(data_path: str, output_dir: str = 'models') -> Dict:
+    def load_model(self, model_path: str) -> None:
+        """Load a trained model from disk."""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at {model_path}")
+        
+        with open(model_path, 'rb') as f:
+            self.classifier = pickle.load(f)
+        
+        logger.info(f"Model loaded from {model_path}")
+
+def train_and_evaluate(data_path: str, output_dir: str = 'models', use_smote: bool = True) -> Dict:
     """
-    Train and evaluate the paper classifier with improved validation.
+    Train and evaluate the paper classifier with improved validation and SMOTE.
     
     Args:
         data_path (str): Path to the processed papers DataFrame
         output_dir (str): Directory to save model and results
+        use_smote (bool): Whether to use SMOTE for handling class imbalance
         
     Returns:
         Dict: Dictionary containing training results and metrics
@@ -412,9 +386,11 @@ def train_and_evaluate(data_path: str, output_dir: str = 'models') -> Dict:
     if missing_columns:
         raise ValueError(f"Missing required columns: {missing_columns}")
     
-    # Check class balance
+    # Check class balance and log distribution
     class_counts = df['Label'].value_counts()
-    logger.info(f"Class distribution:\n{class_counts}")
+    logger.info("\nInitial class distribution:")
+    for label, count in class_counts.items():
+        logger.info(f"Class {label}: {count} samples")
     
     if len(class_counts) < 2:
         raise ValueError("Need at least two classes for training")
@@ -423,62 +399,90 @@ def train_and_evaluate(data_path: str, output_dir: str = 'models') -> Dict:
     if min_class_size < 3:
         raise ValueError(f"Insufficient samples in smallest class: {min_class_size}")
     
-    # Initialize classifier
-    classifier = PaperClassifier(n_splits=5)  # Increased from 3 to 5 for better validation
+    # Calculate imbalance ratio
+    imbalance_ratio = class_counts.max() / class_counts.min()
+    logger.info(f"\nClass imbalance ratio: {imbalance_ratio:.2f}")
+    
+    # Initialize classifier with SMOTE if specified
+    classifier = PaperClassifier(n_splits=5, use_smote=use_smote)
     
     # Generate embeddings
-    logger.info("Generating embeddings for all papers...")
+    logger.info("\nGenerating embeddings for all papers...")
     embeddings = classifier.generate_embeddings(df['Cleaned_Text'].tolist())
     labels = df['Label'].values
     
-    # Perform stratified split with larger test size
+    # Perform stratified split with larger test size for better evaluation
     X_train, X_test, y_train, y_test = train_test_split(
         embeddings, 
         labels,
-        test_size=0.3,  # Increased test size for better evaluation
+        test_size=0.3,
         stratify=labels,
         random_state=42
     )
     
-    # Log split sizes
-    logger.info(f"Training set size: {len(X_train)} ({np.unique(y_train, return_counts=True)[1].tolist()})")
-    logger.info(f"Test set size: {len(X_test)} ({np.unique(y_test, return_counts=True)[1].tolist()})")
+    # Log split sizes and class distribution
+    logger.info("\nData split information:")
+    logger.info(f"Training set size: {len(X_train)}")
+    logger.info(f"Test set size: {len(X_test)}")
+    
+    train_class_dist = pd.Series(y_train).value_counts()
+    test_class_dist = pd.Series(y_test).value_counts()
+    
+    logger.info("\nTraining set class distribution:")
+    for label, count in train_class_dist.items():
+        logger.info(f"Class {label}: {count} samples")
+    
+    logger.info("\nTest set class distribution:")
+    for label, count in test_class_dist.items():
+        logger.info(f"Class {label}: {count} samples")
     
     # Train model
-    logger.info("Training model...")
+    logger.info("\nTraining model...")
     classifier.train(X_train, y_train)
     
     # Get cross-validation results
     cv_results = classifier.get_cv_scores(X_train, y_train)
     logger.info("\nCross-validation Results:")
-    logger.info(f"Individual CV scores: {cv_results['individual_scores']}")
-    logger.info(f"Mean CV score: {cv_results['mean_cv_score']:.4f} (+/- {cv_results['std_cv_score']:.4f})")
+    logger.info(f"Individual CV scores: {cv_results}")
+    logger.info(f"Mean CV score: {cv_results.mean():.4f} (+/- {cv_results.std() * 2:.4f})")
     
     # Evaluate on test set
     logger.info("\nEvaluating on test set...")
-    metrics = classifier.evaluate(X_test, y_test)
+    report, y_test, y_pred = classifier.evaluate(X_test, y_test)
+    
+    # Calculate metrics with zero_division=0 to handle undefined cases
+    accuracy = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
     
     # Detailed evaluation logging
     logger.info(f"\nTest Set Metrics:")
-    logger.info(f"Accuracy: {metrics['accuracy']:.4f}")
-    logger.info(f"F1 Score: {metrics['f1_score']:.4f}")
-    logger.info(f"\nClassification Report:\n{metrics['classification_report']}")
+    logger.info(f"Accuracy: {accuracy:.4f}")
+    logger.info(f"F1 Score: {f1:.4f}")
+    logger.info(f"\nClassification Report:\n{report}")
     
-    # Calculate and log prediction probabilities distribution
-    y_proba = classifier.predict_proba(X_test)
-    class_probs = {
-        'class_0_mean_prob': float(np.mean(y_proba[:, 0])),
-        'class_1_mean_prob': float(np.mean(y_proba[:, 1])),
-        'class_0_std_prob': float(np.std(y_proba[:, 0])),
-        'class_1_std_prob': float(np.std(y_proba[:, 1]))
+    # Prepare metrics dictionary
+    metrics = {
+        'accuracy': accuracy,
+        'f1_score': f1,
+        'classification_report': report,
+        'cross_validation_results': {
+            'individual_scores': cv_results.tolist(),
+            'mean_cv_score': float(cv_results.mean()),
+            'std_cv_score': float(cv_results.std() * 2)
+        },
+        'predictions': {
+            'true_labels': y_test.tolist(),
+            'predicted_labels': y_pred.tolist(),
+            'probabilities': classifier.predict_proba(X_test).tolist()
+        },
+        'smote_info': {
+            'used_smote': use_smote,
+            'initial_class_distribution': class_counts.to_dict(),
+            'train_class_distribution': train_class_dist.to_dict(),
+            'test_class_distribution': test_class_dist.to_dict(),
+            'imbalance_ratio': float(imbalance_ratio)
+        }
     }
-    logger.info("\nPrediction Probability Distribution:")
-    logger.info(f"Class 0 (Non-publishable) - Mean: {class_probs['class_0_mean_prob']:.4f}, Std: {class_probs['class_0_std_prob']:.4f}")
-    logger.info(f"Class 1 (Publishable) - Mean: {class_probs['class_1_mean_prob']:.4f}, Std: {class_probs['class_1_std_prob']:.4f}")
-    
-    # Add probability metrics to results
-    metrics['probability_metrics'] = class_probs
-    metrics['cross_validation_results'] = cv_results
     
     # Save model and results
     classifier.save_model(output_dir)
@@ -489,18 +493,18 @@ def train_and_evaluate(data_path: str, output_dir: str = 'models') -> Dict:
         json.dump(metrics, f, indent=2)
     
     logger.info(f"\nResults saved to {output_dir}")
-    logger.info(f"Best model type: {cv_results.get('best_model_type', 'Not available')}")
-    logger.info(f"Best parameters: {cv_results.get('best_parameters', 'Not available')}")
     
     return metrics
 
 if __name__ == "__main__":
     try:
-        results = train_and_evaluate('data/processed/processed_papers.pkl')
+        results = train_and_evaluate('data/processed/processed_papers.pkl', use_smote=True)
         print(f"\nTraining Summary:")
         print(f"Accuracy: {results['accuracy']:.4f}")
         print(f"F1 Score: {results['f1_score']:.4f}")
         print(f"Cross-validation mean score: {results['cross_validation_results']['mean_cv_score']:.4f}")
+        if results['smote_info']['used_smote']:
+            print("\nSMOTE was used to handle class imbalance")
     except Exception as e:
         logger.error(f"Error during model training and evaluation: {str(e)}")
         raise
